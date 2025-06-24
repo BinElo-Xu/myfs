@@ -1,1022 +1,664 @@
 #include <stdio.h>
-#include <time.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <malloc.h>
 #include <string.h>
+#include <time.h>
+#include <stddef.h>
 
-#define OS_LINUX
+#define _POSIX_C_SOURCE 200809L
 
-// 这里可以修改使用者的用户名
-const char USERNAME[] = "Bin";
+#define DISK_SIZE_MB 10
+#define BLOCK_SIZE 1024
+#define NUM_BLOCKS (DISK_SIZE_MB * 1024 * 1024 / BLOCK_SIZE)
+#define MAX_FILENAME_LEN 16
+#define MAX_OPEN_FILES 10
+#define MAX_DIRECT_BLOCKS 10
+#define INODE_SIZE sizeof(Inode)
+#define NUM_INODES (NUM_BLOCKS / 10)
+#define INODE_TABLE_BLOCKS ((NUM_INODES * INODE_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE)
+#define INODE_BITMAP_SIZE ((NUM_INODES + 7) / 8)
+#define BLOCK_BITMAP_SIZE ((NUM_BLOCKS + 7) / 8)
 
-#define FREE 0
-#define DIRLEN 80
-#define END 65535
-#define SIZE 1024000
-#define BLOCKNUM 1000
-#define BLOCKSIZE 1024
-#define MAXOPENFILE 10
-#define ROOTBLOCKNUM 2
+#define SUPER_BLOCK_START_BLOCK 0
+#define INODE_BITMAP_START_BLOCK (SUPER_BLOCK_START_BLOCK + 1)
+#define BLOCK_BITMAP_START_BLOCK (INODE_BITMAP_START_BLOCK + (INODE_BITMAP_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE)
+#define INODE_TABLE_START_BLOCK (BLOCK_BITMAP_START_BLOCK + (INODE_BITMAP_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE) // Corrected from original as per common FS layout
+#define DATA_BLOCK_START_BLOCK (INODE_TABLE_START_BLOCK + INODE_TABLE_BLOCKS)
 
-#define SAYERROR printf("ERROR: ")
-#define max(X, Y) (((X) > (Y)) ? (X) : (Y))
-#define min(X, Y) (((X) < (Y)) ? (X) : (Y))
+typedef enum { FILE_TYPE_UNKNOWN, FILE_TYPE_REGULAR, FILE_TYPE_DIRECTORY } FileType;
 
-#ifdef OS_WINDOWS
-#define GRN   "dir:"
-#define RESET ""
-#endif //OS_WINDOWS
+typedef struct {
+    unsigned int total_blocks, block_size, num_inodes, free_blocks, free_inodes;
+    unsigned int inode_bitmap_start_block, block_bitmap_start_block, inode_table_start_block, data_block_start_block;
+    unsigned int magic_number;
+    time_t mount_time, last_write_time;
+} SuperBlock;
 
-#ifdef OS_LINUX
-#define GRN   "\x1B[32m"
-#define RESET "\x1B[0m"
-#endif //OS_LINUX
+typedef struct {
+    FileType type;
+    unsigned int size, link_count;
+    time_t create_time, modify_time;
+    unsigned int block_pointers[MAX_DIRECT_BLOCKS];
+} Inode;
 
-typedef struct FAT {
-  unsigned short id;
-} fat;
+typedef struct {
+    char filename[MAX_FILENAME_LEN];
+    unsigned int inode_num;
+} DirEntry;
 
-typedef struct FCB {
-  char free; // 此fcb是否已被删除，因为把一个fcb从磁盘块上删除是很费事的，所以选择利用fcb的free标号来标记其是否被删除
-  char exname[3];
-  char filename[DIRLEN];
-  unsigned short time;
-  unsigned short data;
-  unsigned short first; // 文件起始盘块号
-  unsigned long length; // 文件的实际长度
-  unsigned char attribute; // 文件属性字段：为简单起见，我们只为文件设置了两种属性：值为 0 时表示目录文件，值为 1 时表示数据文件
-} fcb;
+typedef struct {
+    int inode_num, position, flags, is_open;
+} FileDescriptor;
 
-// 对于文件夹fcb，其count永远等于其fcb的length，
-// 只有文件fcb的count会根据打开方式的不同和读写方式的不同而不同
-typedef struct USEROPEN {
-  fcb open_fcb; // 文件的 FCB 中的内容
-  int count; // 读写指针在文件中的位置
-  int dirno; // 相应打开文件的目录项在父目录文件中的盘块号
-  int diroff; // 相应打开文件的目录项在父目录文件的dirno盘块中的起始位置
-  char fcbstate; // 是否修改了文件的 FCB 的内容，如果修改了置为 1，否则为 0
-  char topenfile; // 表示该用户打开表项是否为空，若值为 0，表示为空，否则表示已被某打开文件占据
-  char dir[DIRLEN]; // 打开文件的绝对路径名，这样方便快速检查出指定文件是否已经打开
-} useropen;
+#define OPEN_READ 0x01
+#define OPEN_WRITE 0x02
+#define OPEN_APPEND 0x04
 
-typedef struct BLOCK0 {
-  unsigned short root;
-  char information[200];
-  unsigned char *startblock;
-} block0;
+unsigned char *disk_memory = NULL;
+SuperBlock *g_super_block;
+unsigned char *g_inode_bitmap;
+unsigned char *g_block_bitmap;
+Inode *g_inode_table;
+unsigned int g_current_dir_inode_num;
+FileDescriptor open_fds[MAX_OPEN_FILES];
 
-// utils
-// 这里是一些基础的函数，都是一些会重复利用的操作
-// 根据所给的参数对fcb进行初始化
-void fcb_init(fcb *new_fcb, const char* filename, unsigned short first, unsigned char attribute);
-// 根据所给的参数对一个打开文件项进行初始化
-void useropen_init(useropen *openfile, int dirno, int diroff, const char* dir);
-// 通过dfs对将已使用的fat块释放
-void fatFree(int id);
-// 得到一个空闲的fat块
-int getFreeFatid();
-// 得到一个空闲的打开文件表项
-int getFreeOpenlist();
-// 得到一个fat表的下一个fat表，如果没有则创建
-int getNextFat(int id);
-// 检查一个打开文件表下表是否合法
-int check_fd(int fd);
-// 把一个路径按'/'分割
-int spiltDir(char dirs[DIRLEN][DIRLEN], char *filename);
-// 把一个路径的最后一个目录从字符串中删去
-void popLastDir(char *dir);
-// 把一个路径的最后一个目录从字符串中分割出
-void splitLastDir(char *dir, char new_dir[2][DIRLEN]);
-// 得到某个长度在某个fat中的对应的盘块号和偏移量，用来记录一个打开文件项在其父目录对应fat的位置
-void getPos(int *id, int *offset, unsigned short first, int length);
-// 把路径规范化并检查
-int rewrite_dir(char *dir);
+// Function prototypes (moved to top for clarity and consistency)
+void write_block(unsigned int block_num, const void *buffer);
+void read_block(unsigned int block_num, void *buffer);
+Inode* get_inode(int inode_num);
+int allocate_inode();
+void free_inode(int inode_num);
+int allocate_block();
+void free_block(int block_num);
+int foreach_entry_in_dir(int dir_inode_num, int (*callback)(DirEntry*, void*), void *user_data);
+int find_entry_in_dir(int dir_inode_num, const char *name);
+int parse_path_and_find_parent(const char *path, int *parent_inode_num_out, char *filename_out);
+int find_inode_by_path(const char *path);
+int add_entry_to_dir(int dir_inode_num, const char *name, int new_inode_num);
+void remove_entry_from_dir(int dir_inode_num, const char *name);
+int get_parent_dir_inode_num_from_inode(int current_inode_num);
+void recursive_delete_inode(int inode_num);
+void create_directory(const char *dirname);
+void delete_directory(const char *dirname);
+void list_directory(const char *path);
+void change_directory(const char *dirname);
+void print_current_path();
+void create_file(const char *filename);
+void delete_file(const char *filename);
+int open_file_op(const char *filename, int flags);
+int close_file_op(int fd_idx);
+int read_file_op(int fd_idx, char *buffer, int size);
+int write_file_op(int fd_idx, const char *buffer, int size);
+void init_disk_memory();
+void write_metadata_to_disk();
+void read_metadata_from_disk();
+void format_disk();
+void mount_filesystem();
+void unmount_filesystem();
 
-// basics
-// 根据盘块号和偏移量，直接从FAT上读取指定长度的信息
-int fat_read(unsigned short id, unsigned char *text, int offset, int len);
-// 读取某个已打开文件的指定长度信息
-int do_read(int fd, unsigned char *text, int len);
-// 根据盘块号和偏移量，直接从FAT上写入指定长度的信息
-int fat_write(unsigned short id, unsigned char *text, int blockoffset, int len);
-// 向某个已打开文件写入指定长度信息
-int do_write(int fd, unsigned char *text, int len);
-// 从一个已打开目录文件找到对应名称的文件夹fcb，用于一些不断递归打开文件夹的函数中
-int getFcb(fcb* fcbp, int *dirno, int *diroff, int fd, const char *dir);
-// 在一个已打开目录文件下打开某个文件
-int getOpenlist(int fd, const char *org_dir);
-// 打开文件
-int my_open(char *filename);
 
-// read
-// 读取一个文件夹下的fcb信息
-int read_ls(int fd, unsigned char *text, int len);
-// 把一个文件夹下的fcb信息打印出来
-void my_ls();
-// 把一个打开文件的内容根据文件指针打印出来
-int my_read(int fd);
-// 重新从磁盘中读取一个打开文件的fcb内容
-void my_reload(int fd);
+void write_block(unsigned int block_num, const void *buffer) {
+    if (block_num >= NUM_BLOCKS) return;
+    memcpy(disk_memory + block_num * BLOCK_SIZE, buffer, BLOCK_SIZE);
+}
 
-// write
-// 把键盘输入的信息写入一个打开文件
-int my_write(int fd);
+void read_block(unsigned int block_num, void *buffer) {
+    if (block_num >= NUM_BLOCKS) return;
+    memcpy(buffer, disk_memory + block_num * BLOCK_SIZE, BLOCK_SIZE);
+}
 
-// delete
-// 把一个指定目录的fcb的free置为1
-void my_rmdir(char *dirname);
-// 把一个指定文件的fcb的free置为1
-void my_rm(char *filename);
+Inode* get_inode(int inode_num) {
+    if (inode_num < 0 || inode_num >= (int)NUM_INODES) return NULL;
+    return &g_inode_table[inode_num];
+}
 
-// creat
-// 格式化
-void my_format();
-// 在指定目录下创建一个文件或文件夹
-int my_touch(char *filename, int attribute, int *rpafd);
-// 调用touch创建出一个文件
-int my_create(char *filename);
-// 调用touch创建出一个文件夹
-void my_mkdir(char *dirname);
+int allocate_inode() {
+    for (int i = 0; i < (int)NUM_INODES; i++) {
+        if (!(g_inode_bitmap[i / 8] & (1 << (i % 8)))) {
+            g_inode_bitmap[i / 8] |= (1 << (i % 8));
+            g_super_block->free_inodes--;
+            memset(&g_inode_table[i], 0, sizeof(Inode));
+            return i;
+        }
+    }
+    return -1;
+}
 
-// others
-// 启动系统，做好相关的初始化
-void startsys();
-// 退出系统，做好相应备份工作
-void my_exitsys();
-// 将一个打开文件的fat信息储存下来
-void my_save(int fd);
-// 关闭一个打开文件
-void my_close(int fd);
-// 利用my_open把当前目录切换到指定目录下
-void my_cd(char *dirname);
+void free_inode(int inode_num) {
+    if (inode_num < 0 || inode_num >= (int)NUM_INODES) return;
+    g_inode_bitmap[inode_num / 8] &= ~(1 << (inode_num % 8));
+    g_super_block->free_inodes++;
+}
 
-unsigned char *myvhard;
-useropen openfilelist[MAXOPENFILE];
-int curdirid; // 指向用户打开文件表中的当前目录所在打开文件表项的位置
+int allocate_block() {
+    for (int i = DATA_BLOCK_START_BLOCK; i < (int)NUM_BLOCKS; i++) {
+        if (!(g_block_bitmap[i / 8] & (1 << (i % 8)))) {
+            g_block_bitmap[i / 8] |= (1 << (i % 8));
+            g_super_block->free_blocks--;
+            return i;
+        }
+    }
+    return -1;
+}
 
-unsigned char *blockaddr[BLOCKNUM];
-block0 initblock;
-fat fat1[BLOCKNUM], fat2[BLOCKNUM];
+void free_block(int block_num) {
+    if (block_num < (int)DATA_BLOCK_START_BLOCK || block_num >= (int)NUM_BLOCKS) return;
+    g_block_bitmap[block_num / 8] &= ~(1 << (block_num % 8));
+    g_super_block->free_blocks++;
+}
 
-char str[SIZE];
+int foreach_entry_in_dir(int dir_inode_num, int (*callback)(DirEntry*, void*), void *user_data) {
+    Inode *dir_inode = get_inode(dir_inode_num);
+    if (!dir_inode || dir_inode->type != FILE_TYPE_DIRECTORY) return 0;
+    unsigned char block_buffer[BLOCK_SIZE];
+    for (int i = 0; i < MAX_DIRECT_BLOCKS && dir_inode->block_pointers[i] != 0; i++) {
+        read_block(dir_inode->block_pointers[i], block_buffer);
+        for (int j = 0; j < BLOCK_SIZE / sizeof(DirEntry); j++) {
+            DirEntry *entry = (DirEntry*)(block_buffer + j * sizeof(DirEntry));
+            if (entry->filename[0] != '\0') {
+                if (callback(entry, user_data)) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+typedef struct { const char *name_to_find; int found_inode_num; } FindData;
+int find_entry_callback(DirEntry *entry, void *user_data) {
+    FindData *data = (FindData *)user_data;
+    if (strcmp(entry->filename, data->name_to_find) == 0) {
+        data->found_inode_num = entry->inode_num;
+        return 1;
+    }
+    return 0;
+}
+
+int find_entry_in_dir(int dir_inode_num, const char *name) {
+    FindData data = { .name_to_find = name, .found_inode_num = -1 };
+    foreach_entry_in_dir(dir_inode_num, find_entry_callback, &data);
+    return data.found_inode_num;
+}
+
+int parse_path_and_find_parent(const char *path, int *parent_inode_num_out, char *filename_out) {
+    char *path_copy = strdup(path);
+    if (!path_copy) return -1;
+    char *last_slash = strrchr(path_copy, '/');
+    int parent_inode_num;
+    char *filename;
+    if (last_slash == NULL) {
+        parent_inode_num = g_current_dir_inode_num;
+        filename = path_copy;
+    } else {
+        *last_slash = '\0';
+        filename = last_slash + 1;
+        parent_inode_num = find_inode_by_path((path_copy[0] == '\0') ? "/" : path_copy);
+    }
+    if (parent_inode_num == -1 || strlen(filename) >= MAX_FILENAME_LEN || (strlen(filename) == 0 && strcmp(path, "/") != 0)) {
+        free(path_copy);
+        return -1;
+    }
+    *parent_inode_num_out = parent_inode_num;
+    strncpy(filename_out, filename, MAX_FILENAME_LEN);
+    free(path_copy);
+    return 0;
+}
+
+int find_inode_by_path(const char *path) {
+    if (strcmp(path, "/") == 0) return 0;
+    int current_inode = (path[0] == '/') ? 0 : g_current_dir_inode_num;
+    char *path_copy = strdup((path[0] == '/') ? path + 1 : path);
+    if (!path_copy) return -1;
+    char *token = strtok(path_copy, "/");
+    while (token != NULL) {
+        current_inode = find_entry_in_dir(current_inode, token);
+        if (current_inode == -1) break;
+        token = strtok(NULL, "/");
+    }
+    free(path_copy);
+    return current_inode;
+}
+
+int add_entry_to_dir(int dir_inode_num, const char *name, int new_inode_num) {
+    Inode *dir_inode = get_inode(dir_inode_num);
+    if (!dir_inode || dir_inode->type != FILE_TYPE_DIRECTORY) return -1;
+    DirEntry new_entry = { .inode_num = new_inode_num };
+    strncpy(new_entry.filename, name, MAX_FILENAME_LEN - 1);
+    new_entry.filename[MAX_FILENAME_LEN - 1] = '\0';
+    unsigned char block_buffer[BLOCK_SIZE];
+    for (int i = 0; i < MAX_DIRECT_BLOCKS; i++) {
+        int block_num = dir_inode->block_pointers[i];
+        if (block_num == 0) {
+            block_num = allocate_block();
+            if (block_num == -1) return -1;
+            dir_inode->block_pointers[i] = block_num;
+            memset(block_buffer, 0, BLOCK_SIZE);
+        } else read_block(block_num, block_buffer);
+        for (int j = 0; j < BLOCK_SIZE / sizeof(DirEntry); j++) {
+            DirEntry *entry = (DirEntry*)(block_buffer + j * sizeof(DirEntry));
+            if (entry->filename[0] == '\0') {
+                memcpy(entry, &new_entry, sizeof(DirEntry));
+                write_block(block_num, block_buffer);
+                dir_inode->size += sizeof(DirEntry);
+                dir_inode->modify_time = time(NULL);
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+void remove_entry_from_dir(int dir_inode_num, const char *name) {
+    Inode *dir_inode = get_inode(dir_inode_num);
+    if (!dir_inode || dir_inode->type != FILE_TYPE_DIRECTORY) return;
+    unsigned char block_buffer[BLOCK_SIZE];
+    for (int i = 0; i < MAX_DIRECT_BLOCKS && dir_inode->block_pointers[i] != 0; i++) {
+        read_block(dir_inode->block_pointers[i], block_buffer);
+        for (int j = 0; j < BLOCK_SIZE / (int)sizeof(DirEntry); j++) {
+            DirEntry *entry = (DirEntry*)(block_buffer + j * sizeof(DirEntry));
+            if (entry->filename[0] != '\0' && strcmp(entry->filename, name) == 0) {
+                memset(entry, 0, sizeof(DirEntry));
+                write_block(dir_inode->block_pointers[i], block_buffer);
+                dir_inode->size -= sizeof(DirEntry);
+                dir_inode->modify_time = time(NULL);
+                return;
+            }
+        }
+    }
+}
+
+int get_parent_dir_inode_num_from_inode(int current_inode_num) {
+    return (current_inode_num == 0) ? 0 : find_entry_in_dir(current_inode_num, "..");
+}
+
+void recursive_delete_inode(int inode_num) {
+    Inode *inode = get_inode(inode_num);
+    if (!inode) return;
+    if (inode->type == FILE_TYPE_DIRECTORY) {
+        unsigned char block_buffer[BLOCK_SIZE];
+        for (int i = 0; i < MAX_DIRECT_BLOCKS && inode->block_pointers[i] != 0; i++) {
+            read_block(inode->block_pointers[i], block_buffer);
+            for (int j = 0; j < BLOCK_SIZE / (int)sizeof(DirEntry); j++) {
+                DirEntry *entry = (DirEntry*)(block_buffer + j * sizeof(DirEntry));
+                if (entry->filename[0] != '\0' && strcmp(entry->filename, ".") != 0 && strcmp(entry->filename, "..") != 0) {
+                    recursive_delete_inode(entry->inode_num);
+                }
+            }
+            free_block(inode->block_pointers[i]);
+        }
+    } else {
+        for (int i = 0; i < MAX_DIRECT_BLOCKS && inode->block_pointers[i] != 0; i++) {
+            free_block(inode->block_pointers[i]);
+        }
+    }
+    free_inode(inode_num);
+}
+
+void create_directory(const char *dirname) {
+    char new_dirname[MAX_FILENAME_LEN];
+    int parent_inode_num;
+    if (parse_path_and_find_parent(dirname, &parent_inode_num, new_dirname) != 0 || find_entry_in_dir(parent_inode_num, new_dirname) != -1) return;
+    int new_inode_num = allocate_inode();
+    int data_block = allocate_block();
+    if (new_inode_num == -1 || data_block == -1) {
+        if (new_inode_num != -1) free_inode(new_inode_num);
+        if (data_block != -1) free_block(data_block);
+        return;
+    }
+    Inode *new_dir_inode = get_inode(new_inode_num);
+    *new_dir_inode = (Inode){.type = FILE_TYPE_DIRECTORY, .link_count = 2, .create_time = time(NULL), .modify_time = time(NULL), .block_pointers[0] = data_block};
+    unsigned char empty_block[BLOCK_SIZE] = {0};
+    write_block(data_block, empty_block);
+    add_entry_to_dir(new_inode_num, ".", new_inode_num);
+    add_entry_to_dir(new_inode_num, "..", parent_inode_num);
+    if (add_entry_to_dir(parent_inode_num, new_dirname, new_inode_num) != 0) recursive_delete_inode(new_inode_num);
+    write_metadata_to_disk();
+}
+
+typedef struct { int count; } DirEmptyCheckData;
+int dir_empty_check_callback(DirEntry *entry, void *user_data) {
+    if (strcmp(entry->filename, ".") != 0 && strcmp(entry->filename, "..") != 0) {
+        ((DirEmptyCheckData*)user_data)->count++;
+        return 1;
+    }
+    return 0;
+}
+void delete_directory(const char *dirname) {
+    int target_inode_num = find_inode_by_path(dirname);
+    if (target_inode_num <= 0 || target_inode_num == (int)g_current_dir_inode_num) return;
+    Inode *target_inode = get_inode(target_inode_num);
+    if (target_inode->type != FILE_TYPE_DIRECTORY) return;
+    DirEmptyCheckData check = {0};
+    foreach_entry_in_dir(target_inode_num, dir_empty_check_callback, &check);
+    if (check.count > 0) return;
+    char target_name[MAX_FILENAME_LEN];
+    int parent_inode_num;
+    parse_path_and_find_parent(dirname, &parent_inode_num, target_name);
+    remove_entry_from_dir(parent_inode_num, target_name);
+    recursive_delete_inode(target_inode_num);
+    write_metadata_to_disk();
+}
+
+int list_entry_callback(DirEntry *entry, void *user_data) {
+    (void)user_data;
+    Inode *entry_inode = get_inode(entry->inode_num);
+    if (entry_inode) {
+        char time_buf[20];
+        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M", localtime(&entry_inode->modify_time));
+        printf("%-8s %4d %8u %s  %s\n",
+               (entry_inode->type == FILE_TYPE_DIRECTORY ? "目录" : "文件"),
+               entry->inode_num, entry_inode->size, time_buf, entry->filename);
+    }
+    return 0;
+}
+
+void list_directory(const char *path) {
+    int dir_inode_num = (path == NULL || strlen(path) == 0) ? g_current_dir_inode_num : find_inode_by_path(path);
+    if (dir_inode_num == -1) return;
+    Inode *dir_inode = get_inode(dir_inode_num);
+    if (dir_inode->type != FILE_TYPE_DIRECTORY) return;
+    printf("目录 '%s' (i-node %d) 的内容:\n", (path && strlen(path)>0)?path:".", dir_inode_num);
+    printf("类型       i-节点     大小 最后修改时间        名称\n");
+    printf("---------------------------------------------------------\n");
+    foreach_entry_in_dir(dir_inode_num, list_entry_callback, NULL);
+    printf("---------------------------------------------------------\n");
+}
+
+void change_directory(const char *dirname) {
+    int target_inode_num = find_inode_by_path(dirname);
+    if (target_inode_num == -1) return;
+    Inode *target_inode = get_inode(target_inode_num);
+    if (target_inode->type != FILE_TYPE_DIRECTORY) return;
+    g_current_dir_inode_num = target_inode_num;
+}
+
+void print_current_path() {
+    if (g_current_dir_inode_num == 0) { printf("myfs:/$ "); return; }
+    char path_components[32][MAX_FILENAME_LEN];
+    int depth = 0;
+    int current = g_current_dir_inode_num;
+    while (current != 0 && depth < 32) {
+        int parent = get_parent_dir_inode_num_from_inode(current);
+        if (parent == current) break;
+        Inode* parent_inode = get_inode(parent);
+        unsigned char block_buffer[BLOCK_SIZE];
+        int found = 0;
+        for (int i = 0; i < MAX_DIRECT_BLOCKS && parent_inode->block_pointers[i] != 0 && !found; i++) {
+            read_block(parent_inode->block_pointers[i], block_buffer);
+            for (int j = 0; j < BLOCK_SIZE / (int)sizeof(DirEntry); j++) {
+                DirEntry *entry = (DirEntry*)(block_buffer + j * sizeof(DirEntry));
+                if (entry->inode_num == (unsigned int)current) {
+                    strcpy(path_components[depth++], entry->filename);
+                    found = 1;
+                    break;
+                }
+            }
+        }
+        current = parent;
+    }
+    printf("myfs:/");
+    for (int i = depth - 1; i >= 0; i--) printf("%s/", path_components[i]);
+    printf("$ ");
+}
+
+void create_file(const char *filename) {
+    char new_filename[MAX_FILENAME_LEN];
+    int parent_inode_num;
+    if (parse_path_and_find_parent(filename, &parent_inode_num, new_filename) != 0 || find_entry_in_dir(parent_inode_num, new_filename) != -1) return;
+    int new_inode_num = allocate_inode();
+    if (new_inode_num == -1) return;
+    Inode *new_file_inode = get_inode(new_inode_num);
+    *new_file_inode = (Inode){.type = FILE_TYPE_REGULAR, .size = 0, .link_count = 1, .create_time = time(NULL), .modify_time = time(NULL)};
+    if (add_entry_to_dir(parent_inode_num, new_filename, new_inode_num) != 0) free_inode(new_inode_num);
+    write_metadata_to_disk();
+}
+
+void delete_file(const char *filename) {
+    int target_inode_num = find_inode_by_path(filename);
+    if (target_inode_num < 0) return;
+    for (int i=0; i<MAX_OPEN_FILES; ++i) {
+        if(open_fds[i].is_open && open_fds[i].inode_num == target_inode_num) return;
+    }
+    char target_name[MAX_FILENAME_LEN];
+    int parent_inode_num;
+    parse_path_and_find_parent(filename, &parent_inode_num, target_name);
+    remove_entry_from_dir(parent_inode_num, target_name);
+    recursive_delete_inode(target_inode_num);
+    write_metadata_to_disk();
+}
+
+int open_file_op(const char *filename, int flags) {
+    int file_inode_num = find_inode_by_path(filename);
+    if (file_inode_num < 0 || get_inode(file_inode_num)->type != FILE_TYPE_REGULAR) return -1;
+    int fd_idx = -1;
+    for (int i=0; i < MAX_OPEN_FILES; ++i) { if (!open_fds[i].is_open) { fd_idx = i; break; } }
+    if (fd_idx == -1) return -1;
+    Inode* file_inode = get_inode(file_inode_num);
+    open_fds[fd_idx] = (FileDescriptor){.is_open = 1, .inode_num = file_inode_num, .flags = flags, .position = (flags & OPEN_APPEND) ? file_inode->size : 0};
+    if ((flags & OPEN_WRITE) && !(flags & OPEN_READ) && !(flags & OPEN_APPEND)) {
+        for(int i=0; i<MAX_DIRECT_BLOCKS; ++i) {
+            if (file_inode->block_pointers[i] != 0) { free_block(file_inode->block_pointers[i]); file_inode->block_pointers[i] = 0; }
+        }
+        file_inode->size = 0;
+    }
+    return fd_idx;
+}
+
+int close_file_op(int fd_idx) {
+    if (fd_idx < 0 || fd_idx >= MAX_OPEN_FILES || !open_fds[fd_idx].is_open) return -1;
+    open_fds[fd_idx].is_open = 0;
+    return 0;
+}
+
+int read_file_op(int fd_idx, char *buffer, int size) {
+    if (fd_idx < 0 || fd_idx >= MAX_OPEN_FILES || !open_fds[fd_idx].is_open || !(open_fds[fd_idx].flags & OPEN_READ)) return -1;
+    FileDescriptor *fd = &open_fds[fd_idx];
+    Inode *file_inode = get_inode(fd->inode_num);
+    int bytes_read = 0;
+    unsigned char block_buffer[BLOCK_SIZE];
+    while (bytes_read < size && fd->position < (int)file_inode->size) {
+        int block_idx = fd->position / BLOCK_SIZE;
+        int offset_in_block = fd->position % BLOCK_SIZE;
+        read_block(file_inode->block_pointers[block_idx], block_buffer);
+        int bytes_to_copy = BLOCK_SIZE - offset_in_block;
+        if (bytes_to_copy > size - bytes_read) bytes_to_copy = size - bytes_read;
+        if (fd->position + bytes_to_copy > (int)file_inode->size) bytes_to_copy = file_inode->size - fd->position;
+        memcpy(buffer + bytes_read, block_buffer + offset_in_block, bytes_to_copy);
+        fd->position += bytes_to_copy;
+        bytes_read += bytes_to_copy;
+    }
+    return bytes_read;
+}
+
+int write_file_op(int fd_idx, const char *buffer, int size) {
+    if (fd_idx < 0 || fd_idx >= MAX_OPEN_FILES || !open_fds[fd_idx].is_open || !(open_fds[fd_idx].flags & OPEN_WRITE)) return -1;
+    FileDescriptor *fd = &open_fds[fd_idx];
+    Inode *file_inode = get_inode(fd->inode_num);
+    int bytes_written = 0;
+    unsigned char block_buffer[BLOCK_SIZE];
+    while(bytes_written < size) {
+        int block_idx = fd->position / BLOCK_SIZE;
+        if (block_idx >= MAX_DIRECT_BLOCKS) break;
+        int offset_in_block = fd->position % BLOCK_SIZE;
+        int block_num = file_inode->block_pointers[block_idx];
+        if (block_num == 0) {
+            block_num = allocate_block();
+            if (block_num == -1) break;
+            file_inode->block_pointers[block_idx] = block_num;
+            memset(block_buffer, 0, BLOCK_SIZE);
+        } else read_block(block_num, block_buffer);
+        int bytes_to_copy = BLOCK_SIZE - offset_in_block;
+        if(bytes_to_copy > size - bytes_written) bytes_to_copy = size - bytes_written;
+        memcpy(block_buffer + offset_in_block, buffer + bytes_written, bytes_to_copy);
+        write_block(block_num, block_buffer);
+        fd->position += bytes_to_copy;
+        bytes_written += bytes_to_copy;
+        if ((unsigned int)fd->position > file_inode->size) file_inode->size = fd->position;
+    }
+    file_inode->modify_time = time(NULL);
+    write_metadata_to_disk();
+    return bytes_written;
+}
+
+void init_disk_memory() {
+    disk_memory = (unsigned char *)malloc(DISK_SIZE_MB * 1024 * 1024);
+    if (!disk_memory) exit(EXIT_FAILURE);
+    memset(disk_memory, 0, DISK_SIZE_MB * 1024 * 1024);
+    for(int i = 0; i < MAX_OPEN_FILES; i++) open_fds[i].is_open = 0;
+}
+
+void write_metadata_to_disk() {
+    write_block(SUPER_BLOCK_START_BLOCK, g_super_block);
+    write_block(INODE_BITMAP_START_BLOCK, g_inode_bitmap);
+    write_block(BLOCK_BITMAP_START_BLOCK, g_block_bitmap);
+    for (int i = 0; i < (int)INODE_TABLE_BLOCKS; i++) {
+        write_block(INODE_TABLE_START_BLOCK + i, (unsigned char*)g_inode_table + i * BLOCK_SIZE);
+    }
+}
+
+void read_metadata_from_disk() {
+    read_block(SUPER_BLOCK_START_BLOCK, g_super_block);
+    read_block(INODE_BITMAP_START_BLOCK, g_inode_bitmap);
+    read_block(BLOCK_BITMAP_START_BLOCK, g_block_bitmap);
+    for (int i = 0; i < (int)INODE_TABLE_BLOCKS; i++) {
+        read_block(INODE_TABLE_START_BLOCK + i, (unsigned char*)g_inode_table + i * BLOCK_SIZE);
+    }
+}
+
+void format_disk() {
+    g_super_block = (SuperBlock*)(disk_memory);
+    g_inode_bitmap = disk_memory + INODE_BITMAP_START_BLOCK * BLOCK_SIZE;
+    g_block_bitmap = disk_memory + BLOCK_BITMAP_START_BLOCK * BLOCK_SIZE;
+    g_inode_table = (Inode*)(disk_memory + INODE_TABLE_START_BLOCK * BLOCK_SIZE);
+    *g_super_block = (SuperBlock){
+        .total_blocks = NUM_BLOCKS, .block_size = BLOCK_SIZE, .num_inodes = NUM_INODES,
+        .free_blocks = NUM_BLOCKS, .free_inodes = NUM_INODES,
+        .inode_bitmap_start_block = INODE_BITMAP_START_BLOCK,
+        .block_bitmap_start_block = BLOCK_BITMAP_START_BLOCK,
+        .inode_table_start_block = INODE_TABLE_START_BLOCK,
+        .data_block_start_block = DATA_BLOCK_START_BLOCK,
+        .magic_number = 0xDEADBEEF, .mount_time = time(NULL)
+    };
+    for (int i = 0; i < (int)DATA_BLOCK_START_BLOCK; i++) {
+        g_block_bitmap[i/8] |= (1 << (i%8));
+        g_super_block->free_blocks--;
+    }
+    int root_inode_num = allocate_inode();
+    Inode *root_inode = get_inode(root_inode_num);
+    *root_inode = (Inode){.type = FILE_TYPE_DIRECTORY, .link_count = 2, .create_time = time(NULL), .modify_time = time(NULL)};
+    int root_data_block = allocate_block();
+    root_inode->block_pointers[0] = root_data_block;
+    unsigned char empty_block[BLOCK_SIZE] = {0};
+    write_block(root_data_block, empty_block);
+    add_entry_to_dir(root_inode_num, ".", root_inode_num);
+    add_entry_to_dir(root_inode_num, "..", root_inode_num);
+    g_current_dir_inode_num = 0;
+    write_metadata_to_disk();
+}
+
+void mount_filesystem() {
+    g_super_block = (SuperBlock*)(disk_memory);
+    g_inode_bitmap = disk_memory + INODE_BITMAP_START_BLOCK * BLOCK_SIZE;
+    g_block_bitmap = disk_memory + BLOCK_BITMAP_START_BLOCK * BLOCK_SIZE;
+    g_inode_table = (Inode*)(disk_memory + INODE_TABLE_START_BLOCK * BLOCK_SIZE);
+    if (g_super_block->magic_number != 0xDEADBEEF) format_disk();
+    g_current_dir_inode_num = 0;
+}
+
+void unmount_filesystem() {
+    if (disk_memory) {
+        write_metadata_to_disk();
+        free(disk_memory);
+        disk_memory = NULL;
+    }
+}
+
+typedef void (*CommandHandler)(int argc, char *argv[]);
+typedef struct { const char *name; CommandHandler handler; int min_args; const char *usage; } Command;
+
+void handle_format(int argc, char *argv[]) { (void)argc; (void)argv; format_disk(); }
+void handle_ls(int argc, char *argv[]) { list_directory(argc > 1 ? argv[1] : ""); }
+void handle_cd(int argc, char *argv[]) { change_directory(argv[1]); }
+void handle_mkdir(int argc, char *argv[]) { create_directory(argv[1]); }
+void handle_rmdir(int argc, char *argv[]) { delete_directory(argv[1]); }
+void handle_touch(int argc, char *argv[]) { create_file(argv[1]); }
+void handle_rm(int argc, char *argv[]) { delete_file(argv[1]); }
+
+void handle_open(int argc, char *argv[]) {
+    int flags = 0;
+    if (strcmp(argv[2], "r") == 0) flags = OPEN_READ;
+    else if (strcmp(argv[2], "w") == 0) flags = OPEN_WRITE;
+    else if (strcmp(argv[2], "a") == 0) flags = OPEN_APPEND | OPEN_WRITE;
+    else return;
+    open_file_op(argv[1], flags);
+}
+
+void handle_close(int argc, char *argv[]) { close_file_op(atoi(argv[1])); }
+
+void handle_write(int argc, char *argv[]) {
+    char *line_ptr = strstr(strstr(argv[0], argv[1]), argv[2]); // Simplified strstr usage
+    if (!line_ptr) return;
+    write_file_op(atoi(argv[1]), line_ptr, strlen(line_ptr));
+}
+
+void handle_read(int argc, char *argv[]) {
+    int read_size = atoi(argv[2]);
+    if (read_size <= 0) return;
+    char *read_buffer = malloc(read_size + 1);
+    if (!read_buffer) return;
+    int bytes_read = read_file_op(atoi(argv[1]), read_buffer, read_size);
+    if (bytes_read != -1) read_buffer[bytes_read] = '\0';
+    free(read_buffer);
+}
+
+void handle_help(int argc, char *argv[]);
+
+const Command commands[] = {
+    {"format", handle_format, 1, "用法: format"},
+    {"ls", handle_ls, 1, "用法: ls [目录路径]"},
+    {"cd", handle_cd, 2, "用法: cd <目录路径>"},
+    {"mkdir", handle_mkdir, 2, "用法: mkdir <目录路径>"},
+    {"rmdir", handle_rmdir, 2, "用法: rmdir <目录路径>"},
+    {"touch", handle_touch, 2, "用法: touch <文件路径>"},
+    {"rm", handle_rm, 2, "用法: rm <文件路径>"},
+    {"open", handle_open, 3, "用法: open <文件路径> <模式:r|w|a>"},
+    {"close", handle_close, 2, "用法: close <文件描述符>"},
+    {"write", handle_write, 3, "用法: write <文件描述符> <文本...>"},
+    {"read", handle_read, 3, "用法: read <文件描述符> <大小>"},
+    {"help", handle_help, 1, "用法: help"}
+};
+const int NUM_COMMANDS = sizeof(commands) / sizeof(Command);
+
+void handle_help(int argc, char *argv[]) {
+    (void)argc; (void)argv;
+    for(int i=0; i<NUM_COMMANDS; ++i) printf("  %s\n", commands[i].usage);
+}
 
 int main() {
-  int fd;
-  char command[DIRLEN << 1];
-
-  startsys();
-  printf("%s %s: ", USERNAME, openfilelist[curdirid].dir);
-
-  while (~scanf("%s", command) && strcmp(command, "exit")) {
-    if (!strcmp(command, "ls")) {
-      my_ls();
-    }
-    else if (!strcmp(command, "mkdir")) {
-      scanf("%s", command);
-      if (rewrite_dir(command)) my_mkdir(command);
-    }
-    else if (!strcmp(command, "close")) {
-      scanf("%d", &fd);
-      my_close(fd);
-    }
-    else if (!strcmp(command, "open")) {
-      scanf("%s", command);
-      if (!rewrite_dir(command)) continue;
-      fd = my_open(command);
-      if (0 <= fd && fd < MAXOPENFILE) {
-        if (!openfilelist[fd].open_fcb.attribute) {
-          my_close(fd);
-          printf("%s is dirictory, please use cd command\n", command);
+    init_disk_memory();
+    mount_filesystem();
+    char command_line_orig[256], command_line_copy[256], *argv[32];
+    int argc;
+    while (1) {
+        printf("\n");
+        print_current_path();
+        if (fgets(command_line_orig, sizeof(command_line_orig), stdin) == NULL) break;
+        strcpy(command_line_copy, command_line_orig);
+        argc = 0;
+        char *token = strtok(command_line_copy, " \t\n");
+        while(token != NULL && argc < 31) { argv[argc++] = token; token = strtok(NULL, " \t\n"); }
+        argv[argc] = NULL;
+        if (argc == 0) continue;
+        if (strcmp(argv[0], "exit") == 0) break;
+        int found = 0;
+        for (int i = 0; i < NUM_COMMANDS; i++) {
+            if (strcmp(argv[0], commands[i].name) == 0) {
+                if (argc < commands[i].min_args) { printf("%s\n", commands[i].usage); }
+                else { if (commands[i].handler == handle_write) argv[0] = command_line_orig; commands[i].handler(argc, argv); }
+                found = 1;
+                break;
+            }
         }
-        else {
-          printf("%s is open, it\'s id is %d\n", openfilelist[fd].dir, fd);
-        }
-      }
+        if (!found) { } // Removed "Unknown command" print
     }
-    else if (!strcmp(command, "cd")) {
-      scanf("%s", command);
-      if (rewrite_dir(command)) my_cd(command);
-    }
-    else if (!strcmp(command, "create")) {
-      scanf("%s", command);
-      if (!rewrite_dir(command)) continue;
-      fd = my_create(command);
-      if (0 <= fd && fd < MAXOPENFILE) {
-        printf("%s is created, it\'s id is %d\n", openfilelist[fd].dir, fd);
-      }
-    }
-    else if (!strcmp(command, "rm")) {
-      scanf("%s", command);
-      if (rewrite_dir(command)) my_rm(command);
-    }
-    else if (!strcmp(command, "rmdir")) {
-      scanf("%s", command);
-      if (rewrite_dir(command)) my_rmdir(command);
-    }
-    else if (!strcmp(command, "read")) {
-      scanf("%d", &fd);
-      my_read(fd);
-    }
-    else if (!strcmp(command, "write")) {
-      scanf("%d", &fd);
-      my_write(fd);
-    }
-    else if (!strcmp(command, "sf")) {
-      for (int i = 0; i < MAXOPENFILE; ++i) {
-        if (openfilelist[i].topenfile) printf("  %d : %s\n", i, openfilelist[i].dir);
-      }
-    }
-    else if (!strcmp(command, "format")) {
-      scanf("%s", command);
-      my_format();
-    }
-    else {
-      printf("command %s : no such command\n", command);
-    }
-
-    my_reload(curdirid);
-    printf("%s %s: ", USERNAME, openfilelist[curdirid].dir);
-  }
-
-  my_exitsys();
-  return 0;
-}
-
-// utils
-
-void fcb_init(fcb *new_fcb, const char* filename, unsigned short first, unsigned char attribute) {
-  strcpy(new_fcb->filename, filename);
-  new_fcb->first = first;
-  new_fcb->attribute = attribute;
-  new_fcb->free = 0;
-  if (attribute) new_fcb->length = 0;
-  else new_fcb->length = 2 * sizeof(fcb);
-}
-
-void useropen_init(useropen *openfile, int dirno, int diroff, const char* dir) {
-  openfile->dirno = dirno;
-  openfile->diroff = diroff;
-  strcpy(openfile->dir, dir);
-  openfile->fcbstate = 0;
-  openfile->topenfile = 1;
-  openfile->count = openfile->open_fcb.length;
-}
-
-void fatFree(int id) {
-  if (id == END) return;
-  if (fat1[id].id != END) fatFree(fat1[id].id);
-  fat1[id].id = FREE;
-}
-
-int getFreeFatid() {
-  for (int i = 5; i < BLOCKNUM; ++i) if (fat1[i].id == FREE) return i;
-  return END;
-}
-
-int getFreeOpenlist() {
-  for (int i = 0; i < MAXOPENFILE; ++i) if (!openfilelist[i].topenfile) return i;
-  return -1;
-}
-
-int getNextFat(int id) {
-  if (fat1[id].id == END) fat1[id].id = getFreeFatid();
-  return fat1[id].id;
-}
-
-int check_fd(int fd) {
-  if (!(0 <= fd && fd < MAXOPENFILE)) {
-    SAYERROR;
-    printf("check_fd: %d is invaild index\n", fd);
+    unmount_filesystem();
     return 0;
-  }
-  return 1;
-}
-
-int spiltDir(char dirs[DIRLEN][DIRLEN], char *filename) {
-  int bg = 0; int ed = strlen(filename);
-  if (filename[0] == '/') ++bg;
-  if (filename[ed - 1] == '/') --ed;
-
-  int ret = 0, tlen = 0;
-  for (int i = bg; i < ed; ++i) {
-    if (filename[i] == '/') {
-      dirs[ret][tlen] = '\0';
-      tlen = 0;
-      ++ret;
-    }
-    else {
-      dirs[ret][tlen++] = filename[i];
-    }
-  }
-  dirs[ret][tlen] = '\0';
-
-  return ret+1;
-}
-
-void popLastDir(char *dir) {
-  int len = strlen(dir) - 1;
-  while (dir[len - 1] != '/') --len;
-  dir[len] = '\0';
-}
-
-void splitLastDir(char *dir, char new_dir[2][DIRLEN]) {
-  int len = strlen(dir);
-  int flag = -1;
-  for (int i = 0; i < len; ++i) if (dir[i] == '/') flag = i;
-
-  if (flag == -1) {
-    SAYERROR;
-    printf("splitLastDir: can\'t split %s\n", dir);
-    return;
-  }
-
-  int tlen = 0;
-  for (int i = 0; i < flag; ++i) {
-    new_dir[0][tlen++] = dir[i];
-  }
-  new_dir[0][tlen] = '\0';
-  tlen = 0;
-  for (int i = flag + 1; i < len; ++i) {
-    new_dir[1][tlen++] = dir[i];
-  }
-  new_dir[1][tlen] = '\0';
-}
-
-void getPos(int *id, int *offset, unsigned short first, int length) {
-  int blockorder = length >> 10;
-  *offset = length % 1024;
-  *id = first;
-  while (blockorder) {
-    --blockorder;
-    *id = fat1[*id].id;
-  }
-}
-
-int rewrite_dir(char *dir) {
-  int len = strlen(dir);
-  if (dir[len-1] == '/') --len;
-  int pre = -1;
-  for (int i = 0; i < len; ++i) if (dir[len] == '/') {
-    if (pre != -1) {
-      if (pre + 1 == i) {
-        printf("rewrite_dir: %s is invaild, please check!\n", dir);
-        return 0;
-      }
-    }
-    pre = i;
-  }
-  char newdir[len];
-  if (dir[0] == '/') {
-    strcpy(newdir, "~");
-  }
-  else {
-    strcpy(newdir, openfilelist[curdirid].dir);
-  }
-  strcat(newdir, dir);
-  strcpy(dir, newdir);
-  return 1;
-}
-
-// basics
-int fat_read(unsigned short id, unsigned char *text, int offset, int len) {
-  int ret = 0;
-  unsigned char *buf = (unsigned char*)malloc(BLOCKSIZE);
-  
-  int count = 0;
-  while (len) {
-    memcpy(buf, blockaddr[id], BLOCKSIZE);
-    count = min(len, 1024 - offset);
-    memcpy(text + ret, buf + offset, count);
-    len -= count;
-    ret += count;
-    offset = 0;
-    id = fat1[id].id;
-  }
-
-  free(buf);
-  return ret;
-}
-
-int do_read(int fd, unsigned char *text, int len) {
-  int blockorder = openfilelist[fd].count >> 10;
-  int blockoffset = openfilelist[fd].count % 1024;
-  unsigned short id = openfilelist[fd].open_fcb.first;
-  while (blockorder) {
-    --blockorder;
-    id = fat1[id].id;
-  }
-
-  int ret = fat_read(id, text, blockoffset, len);
-
-  return ret;
-}
-
-int fat_write(unsigned short id, unsigned char *text, int blockoffset, int len) {
-  int ret = 0;
-  char *buf = (char*)malloc(1024);
-  if (buf == NULL) {
-    SAYERROR;
-    printf("fat_write: malloc error\n");
-    return -1;
-  }
-
-  // 写之前先把磁盘长度扩充到所需大小
-  int tlen = len;
-  int toffset = blockoffset;
-  unsigned short tid = id;
-  while (tlen) {
-    if (tlen <= 1024 - toffset) break;
-    tlen -= (1024 - toffset);
-    toffset = 0;
-    id = getNextFat(id);
-    if (id == END) {
-      SAYERROR;
-      printf("fat_write: no next fat\n");
-      return -1;
-    }
-  }
-
-  int count = 0;
-  while (len) {
-    memcpy(buf, blockaddr[id], BLOCKSIZE);
-    count = min(len, 1024 - blockoffset);
-    memcpy(buf + blockoffset, text + ret, count);
-    memcpy(blockaddr[id], buf, BLOCKSIZE);
-    len -= count;
-    ret += count;
-    blockoffset = 0;
-    id = fat1[id].id;
-  }
-
-  free(buf);
-  return ret;
-}
-
-int do_write(int fd, unsigned char *text, int len) {
-  fcb *fcbp = &openfilelist[fd].open_fcb;
-
-  int blockorder = openfilelist[fd].count >> 10;
-  int blockoffset = openfilelist[fd].count % 1024;
-  unsigned short id = openfilelist[fd].open_fcb.first;
-  while (blockorder) {
-    --blockorder;
-    id = fat1[id].id;
-  }
-
-  int ret = fat_write(id, text, blockoffset, len);
-
-  fcbp->length += ret;
-  openfilelist[fd].fcbstate = 1;
-  // 如果文件夹被写了，那么其'.'也要被写进去
-  // 其子文件夹的'..'也要被更新
-  if (!fcbp->attribute) {
-    fcb tmp;
-    memcpy(&tmp, fcbp, sizeof(fcb));
-    strcpy(tmp.filename, ".");
-    memcpy(blockaddr[fcbp->first], &tmp, sizeof(fcb));
-
-    // 如果是根目录的话，".."也要被修改
-    strcpy(tmp.filename, "..");
-    if (fcbp->first == 5) {
-      memcpy(blockaddr[fcbp->first] + sizeof(fcb), &tmp, sizeof(fcb));
-    }
-
-    // 从磁盘中读出当前目录的信息
-    unsigned char buf[SIZE];
-    int read_size = read_ls(fd, buf, fcbp->length);
-    if (read_size == -1) {
-      SAYERROR;
-      printf("do_write: read_ls error\n");
-      return 0;
-    }
-    fcb dirfcb;
-    for (int i = 2 * sizeof(fcb); i < read_size; i += sizeof(fcb)) {
-      memcpy(&dirfcb, buf + i, sizeof(fcb));
-      if (dirfcb.free || dirfcb.attribute) continue;
-      memcpy(blockaddr[dirfcb.first] + sizeof(fcb), &tmp, sizeof(fcb));
-    }
-  }
-
-  return ret;
-}
-
-int getFcb(fcb* fcbp, int *dirno, int *diroff, int fd, const char *dir) {
-  if (fd == -1) {
-    memcpy(fcbp, blockaddr[5], sizeof(fcb));
-    *dirno = 5;
-    *diroff = 0;
-    return 1;
-  }
-  
-  useropen *file = &openfilelist[fd];
-
-  // 从磁盘中读出当前目录的信息
-  unsigned char *buf = (unsigned char *)malloc(SIZE);
-  int read_size = read_ls(fd, buf, file->open_fcb.length);
-  if (read_size == -1) {
-    SAYERROR;
-    printf("getFcb: read_ls error\n");
-    return -1;
-  }
-  fcb dirfcb;
-  int flag = -1;
-  for (int i = 0; i < read_size; i += sizeof(fcb)) {
-    memcpy(&dirfcb, buf + i, sizeof(fcb));
-    if (dirfcb.free) continue;
-    if (!strcmp(dirfcb.filename, dir)) {
-      flag = i;
-      break;
-    }
-  }
-
-  free(buf);
-
-  // 没有找到需要的文件
-  if (flag == -1) return -1;
-
-  // 找到的话就开始计算相关信息，改变对应打开文件项的值
-  getPos(dirno, diroff, file->open_fcb.first, flag);
-  memcpy(fcbp, &dirfcb, sizeof(fcb));
-
-  return 1;
-}
-
-int getOpenlist(int fd, const char *org_dir) {
-  // 把路径名处理成绝对路径
-  char dir[DIRLEN];
-  if (fd == -1) {
-    strcpy(dir, "~/");
-  }
-  else {
-    strcpy(dir, openfilelist[fd].dir);
-    strcat(dir, org_dir);
-  }
-
-  // 如果有打开的目录和想打开的目录重名，必须把原目录的内容写回磁盘
-  for (int i = 0; i < MAXOPENFILE; ++i) if (i != fd) {
-    if (openfilelist[i].topenfile && !strcmp(openfilelist[i].dir, dir)) {
-      my_save(i);
-    }
-  }
-
-  int fileid = getFreeOpenlist();
-  if (fileid == -1) {
-    SAYERROR;
-    printf("getOpenlist: openlist is full\n");
-    return -1;
-  }
-
-  fcb dirfcb;
-  useropen *file = &openfilelist[fileid];
-  int ret;
-  if (fd == -1) {
-    ret = getFcb(&file->open_fcb, &file->dirno, &file->diroff, -1, ".");
-  }
-  else {
-    ret = getFcb(&file->open_fcb, &file->dirno, &file->diroff, fd, org_dir);
-  }
-  strcpy(file->dir, dir);
-  file->fcbstate = 0;
-  file->topenfile = 1;
-
-  //如果打开的是一个文件夹，就在路径后面加上'/'
-  if (!file->open_fcb.attribute) {
-    int len = strlen(file->dir);
-    if (file->dir[len-1] != '/') strcat(file->dir, "/");
-  }
-
-  if (ret == -1) {
-    file->topenfile = 0;
-    return -1;
-  }
-  return fileid;
-}
-
-int my_open(char *filename) {
-  char dirs[DIRLEN][DIRLEN];
-  int count = spiltDir(dirs, filename);
-
-  char realdirs[DIRLEN][DIRLEN];
-  int tot = 0;
-  for (int i = 1; i < count; ++i) {
-    if (!strcmp(dirs[i], ".")) continue;
-    if (!strcmp(dirs[i], "..")) {
-      if (tot) --tot;
-      continue;
-    }
-    strcpy(realdirs[tot++], dirs[i]);
-  }
-
-  // 生成根目录的副本
-  int fd = getOpenlist(-1, "");
-
-  // 利用当前目录的副本不断找到下一个目录
-  int flag = 0;
-  for (int i = 0; i < tot; ++i) {
-    int newfd = getOpenlist(fd, realdirs[i]);
-    if (newfd == -1) {
-      flag = 1;
-      break;
-    }
-    my_close(fd);
-    fd = newfd;
-  }
-  if (flag) {
-    printf("my_open: %s no such file or directory\n", filename);
-    openfilelist[fd].topenfile = 0;
-    return -1;
-  }
-
-  if (openfilelist[fd].open_fcb.attribute) openfilelist[fd].count = 0;
-  else openfilelist[fd].count = openfilelist[fd].open_fcb.length;
-  return fd;
-}
-
-// read
-int read_ls(int fd, unsigned char *text, int len) {
-  int tcount = openfilelist[fd].count;
-  openfilelist[fd].count = 0;
-  int ret = do_read(fd, text, len);
-  openfilelist[fd].count = tcount;
-  return ret;
-}
-
-void my_ls() {
-  // 从磁盘中读出当前目录的信息
-  unsigned char *buf = (unsigned char*)malloc(SIZE);
-  int read_size = read_ls(curdirid, buf, openfilelist[curdirid].open_fcb.length);
-  if (read_size == -1) {
-    free(buf);
-    SAYERROR;
-    printf("my_ls: read_ls error\n");
-    return;
-  }
-  fcb dirfcb;
-  for (int i = 0; i < read_size; i += sizeof(fcb)) {
-    memcpy(&dirfcb, buf + i, sizeof(fcb));
-    if (dirfcb.free) continue;
-    if (dirfcb.attribute) printf(" %s", dirfcb.filename);
-    else printf(" " GRN "%s" RESET, dirfcb.filename);
-  }
-  printf("\n");
-  free(buf);
-}
-
-int my_read(int fd) {
-  if (!(0 <= fd && fd < MAXOPENFILE) || !openfilelist[fd].topenfile ||
-    !openfilelist[fd].open_fcb.attribute) {
-    printf("my_read: fd invaild\n");
-    return -1;
-  }
-
-  unsigned char *buf = (unsigned char *)malloc(SIZE);
-  int len = openfilelist[fd].open_fcb.length - openfilelist[fd].count;
-  int ret = do_read(fd, buf, len);
-  if (ret == -1) {
-    free(buf);
-    printf("my_read: do_read error\n");
-    return -1;
-  }
-  buf[ret] = '\0';
-  printf("%s\n", buf);
-  return ret;
-}
-
-void my_reload(int fd) {
-  if (!check_fd(fd)) return;
-  fat_read(openfilelist[fd].dirno, (unsigned char*)&openfilelist[fd].open_fcb, openfilelist[fd].diroff, sizeof(fcb));
-  return;
-}
-
-// write
-int my_write(int fd) {
-  if (!(0 <= fd && fd < MAXOPENFILE) || !openfilelist[fd].topenfile ||
-    !openfilelist[fd].open_fcb.attribute) {
-    printf("my_write: fd invaild\n");
-    return -1;
-  }
-
-  useropen *file = &openfilelist[fd];
-  printf("please tell me which write style do you prefer?\n");
-  printf("  a : append write\n");
-  printf("  w : truncate write\n");
-  printf("  o : overwrite write\n");
-  char op[5];
-  scanf("%s", op);
-  if (op[0] == 'a') {
-    file->count = file->open_fcb.length;
-  }
-  else if (op[0] == 'w') {
-    file->count = 0;
-    file->open_fcb.length = 0;
-    fatFree(fat1[file->open_fcb.first].id);
-  }
-  else if (op[0] != 'o') {
-    printf("my_write: invaild write style!\n");
-    return -1;
-  }
-
-  int ret = 0;
-  int tmp;
-  while (gets(str)) {
-    int len = strlen(str);
-    str[len] = '\n';
-    tmp = do_write(fd, (unsigned char*)str, len + 1);
-    if (tmp == -1) {
-      SAYERROR;
-      printf("my_write: do_write error\n");
-      return -1;
-    }
-    file->count += tmp;
-    ret += tmp;
-  }
-  return ret;
-}
-
-// delete
-void my_rmdir(char *dirname) {
-  int fd = my_open(dirname);
-  if (0 <= fd && fd < MAXOPENFILE) {
-    if (openfilelist[fd].open_fcb.attribute) {
-      printf("my_rmdir: %s is a file, please use rm command\n", dirname);
-      my_close(fd);
-      return;
-    }
-    if (!strcmp(openfilelist[fd].dir, openfilelist[curdirid].dir)) {
-      printf("my_rmdir: can not remove the current directory!\n");
-      my_close(fd);
-      return;
-    }
-
-    // 从磁盘中读出当前目录的信息
-    int cnt = 0;
-    unsigned char *buf = (unsigned char*)malloc(SIZE);
-    int read_size = read_ls(fd, buf,openfilelist[fd].open_fcb.length);
-    if (read_size == -1) {
-      my_close(fd);
-      free(buf);
-      SAYERROR;
-      printf("my_rmdir: read_ls error\n");
-      return;
-    }
-    fcb dirfcb;
-    int flag = -1;
-    for (int i = 0; i < read_size; i += sizeof(fcb)) {
-      memcpy(&dirfcb, buf + i, sizeof(fcb));
-      if (dirfcb.free) continue;
-      ++cnt;
-    }
-
-    if (cnt > 2) {
-      my_close(fd);
-      printf("my_rmdir: %s is not empty\n", dirname);
-      return;
-    }
-
-    openfilelist[fd].open_fcb.free = 1;
-    fatFree(openfilelist[fd].open_fcb.first);
-    openfilelist[fd].fcbstate = 1;
-    my_close(fd);
-  }
-}
-
-void my_rm(char *filename) {
-  int fd = my_open(filename);
-  if (0 <= fd && fd < MAXOPENFILE) {
-    if (openfilelist[fd].open_fcb.attribute == 0) {
-      printf("my_rm: %s is a directory, please use rmdir command\n", filename);
-      my_close(fd);
-      return;
-    }
-
-    openfilelist[fd].open_fcb.free = 1;
-    fatFree(openfilelist[fd].open_fcb.first);
-    openfilelist[fd].fcbstate = 1;
-    my_close(fd);
-  }
-}
-
-// creat
-void my_format() {
-  strcpy(initblock.information, "10101010");
-  initblock.root = 5;
-  initblock.startblock = blockaddr[5];
-
-  for (int i = 0; i < 5; ++i) fat1[i].id = END;
-  for (int i = 5; i < BLOCKNUM; ++i) fat1[i].id = FREE;
-  for (int i = 0; i < BLOCKNUM; ++i) fat2[i].id = fat1[i].id;
-
-  fat1[5].id = END;
-  fcb root;
-  fcb_init(&root, ".", 5, 0);
-  memcpy(blockaddr[5], &root, sizeof(fcb));
-
-#ifdef DEBUG_INFO
-  printf("my_format %s\n", root.filename);
-#endif // DEBUG_INFO
-
-  strcpy(root.filename, "..");
-  memcpy(blockaddr[5] + sizeof(fcb), &root, sizeof(fcb));
-
-#ifdef DEBUG_INFO
-  printf("my_format %s\n", root.filename);
-#endif // DEBUG_INFO
-
-  printf("初始化完成\n");
-}
-
-int my_touch(char *filename, int attribute, int *rpafd) {
-  // 先打开file的上级目录，如果上级目录不存在就报错（至少自己电脑上的Ubuntu是这个逻辑）
-  char split_dir[2][DIRLEN];
-  splitLastDir(filename, split_dir);
-
-  int pafd = my_open(split_dir[0]);
-  if (!(0 <= pafd && pafd < MAXOPENFILE)) {
-    SAYERROR;
-    printf("my_creat: my_open error\n");
-    return -1;
-  }
-
-  // 从磁盘中读出当前目录的信息，进行检查
-  unsigned char *buf = (unsigned char*)malloc(SIZE);
-  int read_size = read_ls(pafd, buf, openfilelist[pafd].open_fcb.length);
-  if (read_size == -1) {
-    SAYERROR;
-    printf("my_touch: read_ls error\n");
-    return -1;
-  }
-  fcb dirfcb;
-  for (int i = 0; i < read_size; i += sizeof(fcb)) {
-    memcpy(&dirfcb, buf + i, sizeof(fcb));
-    if (dirfcb.free) continue;
-    if (!strcmp(dirfcb.filename, split_dir[1])) {
-      printf("%s is already exit\n", split_dir[1]);
-      return -1;
-    }
-  }
-
-  // 利用空闲磁盘块创建文件
-  int fatid = getFreeFatid();
-  if (fatid == -1) {
-    SAYERROR;
-    printf("my_touch: no free fat\n");
-    return -1;
-  }
-  fat1[fatid].id = END;
-  fcb_init(&dirfcb, split_dir[1], fatid, attribute);
-
-  // 写入父亲目录内存
-  memcpy(buf, &dirfcb, sizeof(fcb));
-  int write_size = do_write(pafd, buf, sizeof(fcb));
-  if (write_size == -1) {
-    SAYERROR;
-    printf("my_touch: do_write error\n");
-    return -1;
-  }
-  openfilelist[pafd].count += write_size;
-
-  // 创建自己的打开文件项
-  int fd = getFreeOpenlist();
-  if (!(0 <= fd && fd < MAXOPENFILE)) {
-    SAYERROR;
-    printf("my_touch: no free fat\n");
-    return -1;
-  }
-  getPos(&openfilelist[fd].dirno, &openfilelist[fd].diroff, openfilelist[pafd].open_fcb.first, openfilelist[pafd].count - write_size);
-  memcpy(&openfilelist[fd].open_fcb, &dirfcb, sizeof(fcb));
-  if (attribute) openfilelist[fd].count = 0;
-  else openfilelist[fd].count = openfilelist[fd].open_fcb.length;
-  openfilelist[fd].fcbstate = 1;
-  openfilelist[fd].topenfile = 1;
-  strcpy(openfilelist[fd].dir, openfilelist[pafd].dir);
-  strcat(openfilelist[fd].dir, split_dir[1]);
-
-  free(buf);
-  *rpafd = pafd;
-  return fd;
-}
-
-int my_create(char *filename) {
-  int pafd;
-  int fd = my_touch(filename, 1, &pafd);
-  if (!check_fd(fd)) return -1;
-  my_close(pafd);
-  return fd;
-}
-
-void my_mkdir(char *dirname) {
-  int pafd;
-  int fd = my_touch(dirname, 0, &pafd);
-  if (!check_fd(fd)) return;
-  unsigned char *buf = (unsigned char*)malloc(SIZE);
-
-  // 把"."和".."装入自己的磁盘
-  fcb dirfcb;
-  memcpy(&dirfcb, &openfilelist[fd].open_fcb, sizeof(fcb));
-  int fatid = dirfcb.first;
-  strcpy(dirfcb.filename, ".");
-  memcpy(blockaddr[fatid], &dirfcb, sizeof(fcb));
-  memcpy(&dirfcb, &openfilelist[pafd].open_fcb, sizeof(fcb));
-  strcpy(dirfcb.filename, "..");
-  memcpy(blockaddr[fatid] + sizeof(fcb), &dirfcb, sizeof(fcb));
-
-  my_close(pafd);
-  my_close(fd);
-  free(buf);
-}
-
-// others
-void startsys() {
-  // 各种变量初始化
-  myvhard = (unsigned char*)malloc(SIZE);
-  for (int i = 0; i < BLOCKNUM; ++i) blockaddr[i] = i * BLOCKSIZE + myvhard;
-  for (int i = 0; i < MAXOPENFILE; ++i) openfilelist[i].topenfile = 0;
-
-  // 准备读入 myfsys 文件信息
-  FILE *fp = fopen("myfsys", "rb");
-  char need_format = 0;
-
-  // 判断是否需要格式化
-  if (fp != NULL) {
-    unsigned char *buf = (unsigned char*)malloc(SIZE);
-    fread(buf, 1, SIZE, fp);
-    memcpy(myvhard, buf, SIZE);
-    memcpy(&initblock, blockaddr[0], sizeof(block0));
-    if (strcmp(initblock.information, "10101010") != 0) need_format = 1;
-    free(buf);
-    fclose(fp);
-  }
-  else {
-    need_format = 1;
-  }
-
-  // 不需要格式化的话接着读入fat信息
-  if (!need_format) {
-    memcpy(fat1, blockaddr[1], sizeof(fat1));
-    memcpy(fat2, blockaddr[3], sizeof(fat2));
-  }
-  else {
-    printf("myfsys 文件系统不存在，现在开始创建文件系统\n");
-    my_format();
-  }
-
-  // 把根目录fcb放入打开文件表中，设定当前目录为根目录
-  curdirid = 0;
-  memcpy(&openfilelist[curdirid].open_fcb, blockaddr[5], sizeof(fcb));
-#ifdef DEBUG_INFO
-  printf("starsys: %s\n", openfilelist[curdirid].open_fcb.filename);
-#endif // DEBUG_INFO
-  useropen_init(&openfilelist[curdirid], 5, 0, "~/");
-}
-
-void my_exitsys() {
-  // 先关闭所有打开文件项
-  for (int i = 0; i < MAXOPENFILE; ++i) my_close(i);
-  
-  memcpy(blockaddr[0], &initblock, sizeof(initblock));
-  memcpy(blockaddr[1], fat1, sizeof(fat1));
-  memcpy(blockaddr[3], fat1, sizeof(fat1));
-  FILE *fp = fopen("myfsys", "wb");
-
-#ifndef DEBUG_DONT_SAVEFILE
-  fwrite(myvhard, BLOCKSIZE, BLOCKNUM, fp);
-#endif // DEBUG_DONT_SAVEFILE
-
-  free(myvhard);
-  fclose(fp);
-}
-
-void my_save(int fd) {
-  if (!check_fd(fd)) return;
-
-  useropen *file = &openfilelist[fd];
-  if (file->fcbstate) fat_write(file->dirno, (unsigned char *)&file->open_fcb, file->diroff, sizeof(fcb));
-  file->fcbstate = 0;
-  return;
-}
-
-void my_close(int fd) {
-  if (!check_fd(fd)) return;
-  if (openfilelist[fd].topenfile == 0) return;
-
-  // 若内容有改变，把fcb内容写回父亲的磁盘块中
-  if (openfilelist[fd].fcbstate) my_save(fd);
-
-  openfilelist[fd].topenfile = 0;
-  return;
-}
-
-void my_cd(char *dirname) {
-  int fd = my_open(dirname);
-  if (!check_fd(fd)) return;
-  if (openfilelist[fd].open_fcb.attribute) {
-    my_close(fd);
-    printf("%s is a file, please use open command\n", openfilelist[fd].dir);
-    return;
-  }
-
-  // 得到的fd是文件夹的话，就把原来的目录关了,把现在的目录设为当前目录
-  my_close(curdirid);
-  curdirid = fd;
 }
